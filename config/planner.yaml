@@ -1,0 +1,49 @@
+/**/planner_server:
+  ros__parameters:
+    use_sim_time: false
+
+    expected_planner_frequency: 1.0
+
+    planner_plugins: ["GridBased"]
+
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      tolerance: 0.5
+      allow_unknown: false
+      motion_model_for_search: "DUBIN"
+      minimum_turning_radius: 0.5
+      analytic_expansion_max_length: 10.0
+      smooth_path: true
+
+
+/**/global_costmap:
+  ros__parameters:
+    use_sim_time: false
+
+    global_frame: blueboat/map
+    robot_base_frame: blueboat/base_link_enu
+
+    update_frequency: 1.0
+    publish_frequency: 1.0
+
+    resolution: 0.25
+
+    robot_radius: 0.8
+
+    track_unknown_space: true
+
+    plugins:
+      - static_layer
+      - inflation_layer
+
+    static_layer:
+      plugin: "nav2_costmap_2d::StaticLayer"
+      map_topic: /blueboat/projected_map
+      map_subscribe_transient_local: true
+
+    inflation_layer:
+      plugin: "nav2_costmap_2d::InflationLayer"
+      inflation_radius: 1.0
+      cost_scaling_factor: 3.0
+
+    always_send_full_costmap: true
