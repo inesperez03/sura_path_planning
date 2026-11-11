@@ -30,6 +30,23 @@ def generate_launch_description():
             remappings=[('cmd_vel', '/blueboat/nav2/cmd_vel')],
         ),
         Node(
+            package='nav2_bt_navigator',
+            executable='bt_navigator',
+            name='bt_navigator',
+            namespace=namespace,
+            output='screen',
+            parameters=[{
+                'use_sim_time': False,
+                'global_frame': 'blueboat/map',
+                'robot_base_frame': 'blueboat/base_link_enu',
+                'odom_topic': '/blueboat/odometry/filtered_enu',
+                'default_nav_to_pose_bt_xml': os.path.join(
+                    config_dir, 'navigate_to_pose.xml'),
+                'default_nav_through_poses_bt_xml': os.path.join(
+                    config_dir, 'navigate_through_poses.xml'),
+            }],
+        ),
+        Node(
             package='sura_path_planning',
             executable='nav2_velocity_adapter',
             name='nav2_velocity_adapter',
@@ -47,17 +64,12 @@ def generate_launch_description():
         Node(
             package='nav2_lifecycle_manager',
             executable='lifecycle_manager',
-            name='lifecycle_manager_planning',
+            name='lifecycle_manager_navigation',
             namespace=namespace,
             output='screen',
-            parameters=[{'autostart': True, 'node_names': ['planner_server']}],
-        ),
-        Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_controller',
-            namespace=namespace,
-            output='screen',
-            parameters=[{'autostart': True, 'node_names': ['controller_server']}],
+            parameters=[{
+                'autostart': True,
+                'node_names': ['planner_server', 'controller_server', 'bt_navigator'],
+            }],
         ),
     ])

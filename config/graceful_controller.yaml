@@ -59,8 +59,8 @@
     height: 30
     resolution: 0.25
 
-    # Dimensiones del BlueBoat
-    robot_radius: 0.4
+    # Same clearance as the global costmap
+    robot_radius: 1.0
 
     track_unknown_space: true
 
@@ -83,6 +83,7 @@
 
       inflation_radius: 1.0
       cost_scaling_factor: 3.0
+      inflate_unknown: true
 
     always_send_full_costmap: true
 
@@ -92,5 +93,5 @@
 
     requester: "nav2"
     controller: "body_velocity"
-    priority: 80
+    priority: 70
     frame_id: "blueboat/base_link"

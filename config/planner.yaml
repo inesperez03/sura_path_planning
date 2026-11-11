@@ -28,7 +28,7 @@
 
     resolution: 0.25
 
-    robot_radius: 0.8
+    robot_radius: 1.0
 
     track_unknown_space: true
 
@@ -45,5 +45,6 @@
       plugin: "nav2_costmap_2d::InflationLayer"
       inflation_radius: 1.0
       cost_scaling_factor: 3.0
+      inflate_unknown: true
 
     always_send_full_costmap: true

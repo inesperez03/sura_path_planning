@@ -6,7 +6,8 @@
 #include <interactive_markers/interactive_marker_server.hpp>
 #include <interactive_markers/menu_handler.hpp>
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
-#include <nav2_msgs/action/follow_path.hpp>
+#include <nav2_msgs/action/navigate_to_pose.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <visualization_msgs/msg/interactive_marker.hpp>
@@ -17,19 +18,21 @@
 class SimpleNavigator : public rclcpp::Node
 {
 public:
-  using Plan = nav2_msgs::action::ComputePathToPose;
-  using Follow = nav2_msgs::action::FollowPath;
-  using FollowHandle = rclcpp_action::ClientGoalHandle<Follow>;
+  using Navigate = nav2_msgs::action::NavigateToPose;
+  using NavigateHandle = rclcpp_action::ClientGoalHandle<Navigate>;
+  using ComputePath = nav2_msgs::action::ComputePathToPose;
+  using ComputePathHandle = rclcpp_action::ClientGoalHandle<ComputePath>;
 
   SimpleNavigator() : Node("simple_navigator")
   {
-    planner_ = rclcpp_action::create_client<Plan>(this, "compute_path_to_pose");
-    follower_ = rclcpp_action::create_client<Follow>(this, "follow_path");
+    navigator_ = rclcpp_action::create_client<Navigate>(this, "navigate_to_pose");
+    planner_ = rclcpp_action::create_client<ComputePath>(this, "compute_path_to_pose");
+    plan_publisher_ = create_publisher<nav_msgs::msg::Path>("plan", 10);
     goals_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/goal_pose", 10,
-      [this](geometry_msgs::msg::PoseStamped::SharedPtr goal) {navigate(*goal);});
+      [this](geometry_msgs::msg::PoseStamped::SharedPtr goal) {stageGoal(*goal);});
     createGoalMarker();
-    RCLCPP_INFO(get_logger(), "Ready for goals on /goal_pose or the RViz marker");
+    RCLCPP_INFO(get_logger(), "Set a goal, then use Compute path and Go to pose on the RViz marker");
   }
 
 private:
@@ -97,18 +100,105 @@ private:
 
     marker_server_ = std::make_unique<interactive_markers::InteractiveMarkerServer>(
       "nav2/interactive_markers", this);
-    marker_server_->insert(marker);
+    marker_server_->insert(marker, [this](const auto & feedback) {
+      if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
+        geometry_msgs::msg::PoseStamped goal;
+        goal.header.frame_id = "blueboat/map";
+        goal.header.stamp = now();
+        goal.pose = feedback->pose;
+        staged_goal_ = goal;
+        invalidatePreview();
+      }
+    });
     menu_handler_ = std::make_unique<interactive_markers::MenuHandler>();
-    menu_handler_->insert("Go to pose", [this](const auto & feedback) {
+    menu_handler_->insert("Compute path", [this](const auto & feedback) {
       geometry_msgs::msg::PoseStamped goal;
       goal.header.frame_id = "blueboat/map";
       goal.header.stamp = now();
       goal.pose = feedback->pose;
-      goal.pose.position.z = 0.0;
+      staged_goal_ = goal;
+      computePath();
+    });
+    go_menu_entry_ = menu_handler_->insert("Go to pose", [this](const auto & feedback) {
+      (void)feedback;
+      if (!path_ready_) {
+        RCLCPP_WARN(get_logger(), "Compute path first and wait for the preview");
+        return;
+      }
+      auto goal = staged_goal_;
+      goal.header.stamp = now();
       navigate(goal);
     });
+    menu_handler_->setVisible(go_menu_entry_, false);
     menu_handler_->apply(*marker_server_, marker.name);
     marker_server_->applyChanges();
+  }
+
+  void stageGoal(const geometry_msgs::msg::PoseStamped & goal)
+  {
+    if (goal.header.frame_id != "blueboat/map") {
+      RCLCPP_ERROR(get_logger(), "Goal must be in blueboat/map, got '%s'", goal.header.frame_id.c_str());
+      return;
+    }
+    staged_goal_ = goal;
+    staged_goal_.pose.position.z = 0.0;
+    marker_server_->setPose("nav2_goal", staged_goal_.pose);
+    marker_server_->applyChanges();
+    invalidatePreview();
+    RCLCPP_INFO(get_logger(), "Goal staged; use Compute path on the RViz marker");
+  }
+
+  void invalidatePreview()
+  {
+    ++preview_revision_;
+    path_ready_ = false;
+    menu_handler_->setVisible(go_menu_entry_, false);
+    menu_handler_->reApply(*marker_server_);
+    marker_server_->applyChanges();
+    nav_msgs::msg::Path empty_plan;
+    empty_plan.header.frame_id = "blueboat/map";
+    empty_plan.header.stamp = now();
+    plan_publisher_->publish(empty_plan);
+  }
+
+  void computePath()
+  {
+    invalidatePreview();
+    const auto revision = preview_revision_;
+    if (!planner_->wait_for_action_server(std::chrono::seconds(1))) {
+      RCLCPP_ERROR(get_logger(), "Nav2 planner is not ready; try Compute path again");
+      return;
+    }
+
+    ComputePath::Goal request;
+    request.goal = staged_goal_;
+    request.goal.pose.position.z = 0.0;
+    request.planner_id = "GridBased";
+    request.use_start = false;
+    rclcpp_action::Client<ComputePath>::SendGoalOptions options;
+    options.goal_response_callback = [this, revision](ComputePathHandle::SharedPtr handle) {
+      if (!handle && revision == preview_revision_) {
+        RCLCPP_ERROR(get_logger(), "Planner rejected the goal");
+      }
+    };
+    options.result_callback = [this, revision](const auto & result) {
+      if (revision != preview_revision_) {return;}
+      if (result.code != rclcpp_action::ResultCode::SUCCEEDED ||
+        !result.result || result.result->path.poses.empty())
+      {
+        RCLCPP_ERROR(get_logger(), "Could not compute a path to this pose");
+        return;
+      }
+      plan_publisher_->publish(result.result->path);
+      path_ready_ = true;
+      menu_handler_->setVisible(go_menu_entry_, true);
+      menu_handler_->reApply(*marker_server_);
+      marker_server_->applyChanges();
+      RCLCPP_INFO(get_logger(), "Path ready (%zu poses); use Go to pose on the RViz marker",
+        result.result->path.poses.size());
+    };
+    planner_->async_send_goal(request, options);
+    RCLCPP_INFO(get_logger(), "Computing path...");
   }
 
   void navigate(const geometry_msgs::msg::PoseStamped & pose)
@@ -119,73 +209,49 @@ private:
     }
     ++goal_number_;
     const auto number = goal_number_;
-    if (follow_handle_) {
-      follower_->async_cancel_goal(follow_handle_);
-      follow_handle_.reset();
+    if (navigate_handle_) {
+      navigator_->async_cancel_goal(navigate_handle_);
+      navigate_handle_.reset();
     }
-    if (!planner_->wait_for_action_server(std::chrono::seconds(1)) ||
-      !follower_->wait_for_action_server(std::chrono::seconds(1)))
-    {
-      RCLCPP_ERROR(get_logger(), "Nav2 planner or controller is not ready; send the goal again");
+    if (!navigator_->wait_for_action_server(std::chrono::seconds(1))) {
+      RCLCPP_ERROR(get_logger(), "Nav2 navigator is not ready; send the goal again");
       return;
     }
 
-    Plan::Goal request;
-    request.goal = pose;
-    request.planner_id = "GridBased";
-    request.use_start = false;
-    rclcpp_action::Client<Plan>::SendGoalOptions options;
-    options.goal_response_callback = [this, number](auto handle) {
-      if (number == goal_number_ && !handle) {
-        RCLCPP_ERROR(get_logger(), "Planner rejected the goal");
-      }
-    };
-    options.result_callback = [this, number](const auto & result) {
-      if (number != goal_number_) {return;}
-      if (result.code != rclcpp_action::ResultCode::SUCCEEDED ||
-        !result.result || result.result->path.poses.empty())
-      {
-        RCLCPP_ERROR(get_logger(), "No path to the destination");
-        return;
-      }
-      follow(result.result->path, number);
-    };
-    planner_->async_send_goal(request, options);
-  }
-
-  void follow(const nav_msgs::msg::Path & path, uint64_t number)
-  {
-    Follow::Goal request;
-    request.path = path;
-    request.controller_id = "FollowPath";
-    request.goal_checker_id = "goal_checker";
-    rclcpp_action::Client<Follow>::SendGoalOptions options;
-    options.goal_response_callback = [this, number](FollowHandle::SharedPtr handle) {
+    Navigate::Goal request;
+    request.pose = pose;
+    rclcpp_action::Client<Navigate>::SendGoalOptions options;
+    options.goal_response_callback = [this, number](NavigateHandle::SharedPtr handle) {
       if (number != goal_number_) {
-        if (handle) {follower_->async_cancel_goal(handle);}
+        if (handle) {navigator_->async_cancel_goal(handle);}
         return;
       }
-      follow_handle_ = handle;
-      if (!handle) {RCLCPP_ERROR(get_logger(), "Controller rejected the path");}
+      navigate_handle_ = handle;
+      if (!handle) {RCLCPP_ERROR(get_logger(), "Navigator rejected the goal");}
     };
     options.result_callback = [this, number](const auto & result) {
       if (number != goal_number_) {return;}
-      follow_handle_.reset();
+      navigate_handle_.reset();
       if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
         RCLCPP_INFO(get_logger(), "Destination reached");
       } else {
-        RCLCPP_ERROR(get_logger(), "Path following stopped");
+        RCLCPP_ERROR(get_logger(), "Navigation stopped");
       }
     };
-    follower_->async_send_goal(request, options);
+    navigator_->async_send_goal(request, options);
   }
 
-  rclcpp_action::Client<Plan>::SharedPtr planner_;
-  rclcpp_action::Client<Follow>::SharedPtr follower_;
+  rclcpp_action::Client<Navigate>::SharedPtr navigator_;
+  rclcpp_action::Client<ComputePath>::SharedPtr planner_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr plan_publisher_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goals_;
   std::unique_ptr<interactive_markers::MenuHandler> menu_handler_;
+  interactive_markers::MenuHandler::EntryHandle go_menu_entry_{};
   std::unique_ptr<interactive_markers::InteractiveMarkerServer> marker_server_;
-  FollowHandle::SharedPtr follow_handle_;
+  NavigateHandle::SharedPtr navigate_handle_;
+  geometry_msgs::msg::PoseStamped staged_goal_;
+  uint64_t preview_revision_{0};
+  bool path_ready_{false};
   uint64_t goal_number_{0};
 };
 
